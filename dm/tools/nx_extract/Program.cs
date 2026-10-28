@@ -11,6 +11,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using LibHac.Common;
 using LibHac.Common.Keys;
@@ -69,13 +70,71 @@ static class P {
             Console.WriteLine("program has no data section: empty RomFS");
             return Damaged();
         }
-        IStorage romfs = updProg != null ? baseProg.OpenStorageWithPatch(updProg, NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid) : baseProg.OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid);
+        IStorage romfs = OpenStorageWithPatch(baseProg, updProg, NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid);
         // the same RomFS without hash checks, for reading damaged files as they are (--allow-damaged)
-        g_lenient = () => new RomFsFileSystem(updProg != null ? baseProg.OpenStorageWithPatch(updProg, NcaSectionType.Data, IntegrityCheckLevel.IgnoreOnInvalid) : baseProg.OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.IgnoreOnInvalid));
+        g_lenient = () => new RomFsFileSystem(OpenStorageWithPatch(baseProg, updProg, NcaSectionType.Data, IntegrityCheckLevel.IgnoreOnInvalid));
         if (manifest) Manifest(new RomFsFileSystem(romfs), Path.Combine(outDir, "romfs_manifest.tsv"));
         else if (image) WriteImage(new RomFsFileSystem(romfs), Path.Combine(outDir, "RomFS.img"));
         else Copy(new RomFsFileSystem(romfs), Path.Combine(outDir, "RomFS"), cmpDir);
         return Damaged();
+    }
+
+    // Handle BKTR patch sections whose encryption tree has 0 entries (no patch RomFS data, only relocations):
+    // LibHac 0.19.0 unconditionally creates an Aes128CtrExStorage whose BucketTree rejects entryCount <= 0 (2002-6001)
+    static IStorage OpenStorageWithPatch(Nca baseNca, Nca patchNca, NcaSectionType type, IntegrityCheckLevel integrityCheckLevel) {
+        if (patchNca == null) return baseNca.OpenStorage(type, integrityCheckLevel);
+        int index = Nca.GetSectionIndexFromType(type, baseNca.Header.ContentType);
+        var patchHdr = patchNca.GetFsHeader(index);
+        var patchInfo = patchHdr.GetPatchInfo();
+        BucketTree.Header encHeader = default;
+        patchInfo.EncryptionTreeHeader.CopyTo(SpanHelpers.AsByteSpan(ref encHeader));
+        if (patchHdr.EncryptionType != NcaEncryptionType.AesCtrEx || encHeader.EntryCount > 0)
+            return baseNca.OpenStorageWithPatch(patchNca, type, integrityCheckLevel);
+
+        IStorage rawEnc = patchNca.OpenRawStorage(index, openEncrypted: true);
+        byte[] key = patchNca.Header.HasRightsId ? patchNca.GetDecryptedTitleKey() : patchNca.GetDecryptedKey(2);
+        long secStart = patchNca.Header.GetSectionStartOffset(index);
+        long secSize = patchNca.Header.GetSectionSize(index);
+        long relocOffset = patchInfo.RelocationTreeOffset;
+        byte[] counterMeta = Aes128CtrStorage.CreateCounter(patchHdr.Counter, relocOffset + secStart);
+        IStorage metaStorage = new CachedStorage(new Aes128CtrStorage(rawEnc.Slice(relocOffset, secSize - relocOffset), key, counterMeta, leaveOpen: true), 4, leaveOpen: true);
+        IStorage patchRawDecrypted;
+        if (relocOffset > 0) {
+            byte[] counterData = Aes128CtrStorage.CreateCounter(patchHdr.Counter, secStart);
+            IStorage dataStorage = new CachedStorage(new Aes128CtrStorage(rawEnc.Slice(0, relocOffset), key, counterData, leaveOpen: true), 4, leaveOpen: true);
+            patchRawDecrypted = new ConcatenationStorage(new IStorage[] { dataStorage, metaStorage }, leaveOpen: true);
+        } else {
+            patchRawDecrypted = metaStorage;
+        }
+
+        IStorage rawStorage;
+        if (patchInfo.RelocationTreeSize == 0) {
+            rawStorage = patchRawDecrypted;
+        } else {
+            IStorage baseRaw = baseNca.SectionExists(index) ? baseNca.OpenRawStorage(index) : new NullStorage();
+            patchRawDecrypted.GetSize(out long patchSize).ThrowIfFailure();
+            baseRaw.GetSize(out long baseSize).ThrowIfFailure();
+            BucketTree.Header relocHeader = default;
+            patchInfo.RelocationTreeHeader.CopyTo(SpanHelpers.AsByteSpan(ref relocHeader));
+            long nodeSize = IndirectStorage.QueryNodeStorageSize(relocHeader.EntryCount);
+            long entrySize = IndirectStorage.QueryEntryStorageSize(relocHeader.EntryCount);
+            CachedStorage treeStorage = new CachedStorage(new SubStorage(patchRawDecrypted, patchInfo.RelocationTreeOffset, patchInfo.RelocationTreeSize), IndirectStorage.NodeSize, 4, leaveOpen: true);
+            using ValueSubStorage nodeStorage = new ValueSubStorage(treeStorage, 0L, nodeSize);
+            using ValueSubStorage entryStorage = new ValueSubStorage(treeStorage, nodeSize, entrySize);
+            var indirectStorage = new IndirectStorage();
+            indirectStorage.Initialize(new LibHac.ArrayPoolMemoryResource(), in nodeStorage, in entryStorage, relocHeader.EntryCount).ThrowIfFailure();
+            indirectStorage.SetStorage(0, baseRaw, 0L, baseSize);
+            indirectStorage.SetStorage(1, patchRawDecrypted, 0L, patchSize);
+            rawStorage = indirectStorage;
+        }
+
+        var miVerify = typeof(Nca).GetMethod("CreateVerificationStorage", BindingFlags.NonPublic | BindingFlags.Instance);
+        IStorage storage = (IStorage)miVerify.Invoke(patchNca, new object[] { integrityCheckLevel, patchHdr, rawStorage });
+        if (patchHdr.ExistsCompressionLayer()) {
+            var miComp = typeof(Nca).GetMethod("OpenCompressedStorage", BindingFlags.NonPublic | BindingFlags.Static);
+            storage = (IStorage)miComp.Invoke(null, new object[] { patchHdr, storage });
+        }
+        return storage;
     }
 
     // Files whose data failed the hash check: listed at the end; exit code 3 unless --allow-damaged
